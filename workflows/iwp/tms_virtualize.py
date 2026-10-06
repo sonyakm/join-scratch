@@ -27,11 +27,14 @@ import s3fs
 import obstore
 from obstore.store import S3Store
 from obspec_utils.registry import ObjectStoreRegistry
+from zarr.errors import ContainsGroupError
 
+
+#AWS location and credential set up
 
 S3_BUCKET = "airborne-smce-prod-user-bucket"
 SAT_PREFIX = "TMS"
-SAT_PRODUCT = "TS02_L1B-TB"
+SAT_PRODUCT = "TS09_L1C-TC"
 S3_PREFIX = f'JOIN/{SAT_PREFIX}/{SAT_PRODUCT}/'
 S3_ICECHUNK = f'JOIN/icechunk-stores/{SAT_PREFIX}/{SAT_PRODUCT}/'
 S3_REGION  = "us-west-2"
@@ -54,8 +57,10 @@ s3_store = S3Store.from_url(f"s3://{S3_BUCKET}/", region=S3_REGION, skip_signatu
             token=TOKEN  )
 registry  = ObjectStoreRegistry({f"s3://{S3_BUCKET}/": s3_store})
 
+#end AWS/icechunk config/setup
+
 def read_tms_coords(key: str) -> dict:
-    """Eagerly read time, latitude, longitude from a TMS L1C-TC granule."""
+    """Eagerly read time, latitude, longitude from a TMS granule."""
     if key.startswith("s3://"):
         relative_key = key.split("/", 3)[-1]
     elif key.startswith(S3_BUCKET):
@@ -175,50 +180,108 @@ def list_s3_netcdf_keys(bucket_name: str,
     
     return netcdf_keys
 
-keys = list_s3_netcdf_keys(bucket_name = S3_BUCKET, prefix = S3_PREFIX)
-print(f"Found {len(keys)} netCDF files:")
-vds_list = [make_tms_vds(k) for k in keys]
-
-def extract_granule_id(key: str) -> str:
-    """Extracts the start time (e.g., ST20260217-014358) to use as a group name."""
-    m = re.search(r"(ST\d{8}-\d{6})", key)
-    return m.group(1) if m else f"granule_{hash(key)}"
-
-print(f"Writing tms ({len(keys)} granules)…")
-config = icechunk.RepositoryConfig.default()
-config.set_virtual_chunk_container(
-    icechunk.VirtualChunkContainer(
-        f"s3://{S3_BUCKET}/",
-        icechunk.s3_store(region=S3_REGION),
+def read_tms_icechunk():
+    # Connect to the Icechunk store using your AWS environment credentials
+    storage = icechunk.s3_storage(
+        bucket=S3_BUCKET,
+        prefix=S3_ICECHUNK,
+        region=S3_REGION,
+        from_env=True
     )
-)
-storage = s3_storage(
-    bucket=S3_BUCKET,
-    prefix=S3_ICECHUNK,
-    region=S3_REGION,
-    from_env=True
-)
+    
+    config = icechunk.RepositoryConfig.default()
+    config.set_virtual_chunk_container(
+        icechunk.VirtualChunkContainer(
+            f"s3://{S3_BUCKET}/",
+            icechunk.s3_store(region=S3_REGION),
+        )
+    )
+    
+    virtual_creds = {
+            f"s3://{S3_BUCKET}/": None
+        }
+    
+    # Open repository and a read-only session on the main branch
+    repo = icechunk.Repository.open(
+        storage, 
+        config=config,
+        authorize_virtual_chunk_access=virtual_creds
+    )
+    session = repo.readonly_session(branch="main")
+    
+    # 3. Discover available granules
+    # We use Zarr to peek into the store and list the groups you created
+    z_root = zarr.open(session.store, mode='r')
+    tms_group = z_root[SAT_PRODUCT]
+    granule_ids = list(tms_group.group_keys())
+    
+    print(f"Found {len(granule_ids)} granules in the Icechunk store.")
+    print("First 3 granules:", granule_ids[:3])
+    
+    # 4. Open a specific granule with xarray
+    # Let's open the first one for analysis
+    target_granule = granule_ids[0]
+    group_path = f"{SAT_PRODUCT}/{target_granule}"
+    
+    # consolidated=False is typically required for Icechunk virtual stores
+    ds = xr.open_zarr(session.store, group=group_path, consolidated=False)
 
+    return ds
 
-print("Writing virtual references iteratively to Icechunk...")
-repository = Repository.open_or_create(storage, config=config)
-for i, key in enumerate(keys):
-    # 1. Create the virtual dataset
-    vds = make_tms_vds(key)
-    
-    # 2. Open a writable session
-    session = repository.writable_session("main")
-    
-    # 3. Put each granule in its own isolated sub-group
-    gran_id = extract_granule_id(key)
-    group_name = f"tms_l1c_tc/{gran_id}"
-    
-    # 4. Write directly to Icechunk (no append_dim needed!)
-    virtual_dataset_to_icechunk(vds, session.store, group=group_name)
-    
-    # 5. Commit the session
-    session.commit(f"Virtualize TMS {gran_id} ({i+1}/{len(keys)})")
-    
-    print(f"  {i+1}/{len(keys)} committed")
+if __name__ == "__main__":
 
-print("TMS virtualization done.")
+    keys = list_s3_netcdf_keys(bucket_name = S3_BUCKET, prefix = S3_PREFIX)
+    print(f"Found {len(keys)} netCDF files:")
+    vds_list = [make_tms_vds(k) for k in keys]
+    
+    def extract_granule_id(key: str) -> str:
+        """Extracts the start time (e.g., ST20260217-014358) to use as a group name."""
+        m = re.search(r"(ST\d{8}-\d{6})", key)
+        return m.group(1) if m else f"granule_{hash(key)}"
+    
+    print(f"Writing tms ({len(keys)} granules)…")
+    config = icechunk.RepositoryConfig.default()
+    config.set_virtual_chunk_container(
+        icechunk.VirtualChunkContainer(
+            f"s3://{S3_BUCKET}/",
+            icechunk.s3_store(region=S3_REGION),
+        )
+    )
+    storage = s3_storage(
+        bucket=S3_BUCKET,
+        prefix=S3_ICECHUNK,
+        region=S3_REGION,
+        from_env=True
+    )
+    
+    
+    print("Writing virtual references iteratively to Icechunk...")
+    repository = Repository.open_or_create(storage, config=config)
+    for i, key in enumerate(keys):
+        try:
+            # Create the virtual dataset
+            vds = make_tms_vds(key)
+    
+            # Open a writable session
+            session = repository.writable_session("main")
+            
+            # Put each granule in its own isolated sub-group
+            gran_id = extract_granule_id(key)
+            group_name = f"{SAT_PRODUCT}/{gran_id}"
+    
+            
+            # Write directly to Icechunk
+            virtual_dataset_to_icechunk(vds, session.store, group=group_name)
+            
+            # Commit the session
+            session.commit(f"Virtualize TMS {gran_id} ({i+1}/{len(keys)})")
+            print(f"  {i+1}/{len(keys)} committed")
+            
+        except ContainsGroupError:
+            # If the group already exists, the session simply isn't committed
+            # and we safely move on to the next one!
+            print(f"  {i+1}/{len(keys)} skipped: {group_name} already exists.")
+            continue
+
+    
+    print("TMS virtualization done.")
