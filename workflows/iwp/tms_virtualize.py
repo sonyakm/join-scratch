@@ -34,7 +34,7 @@ from zarr.errors import ContainsGroupError
 
 S3_BUCKET = "airborne-smce-prod-user-bucket"
 SAT_PREFIX = "TMS"
-SAT_PRODUCT = "TS09_L1C-TC"
+SAT_PRODUCT = "TS02_L1C-TCR"
 S3_PREFIX = f'JOIN/{SAT_PREFIX}/{SAT_PRODUCT}/'
 S3_ICECHUNK = f'JOIN/icechunk-stores/{SAT_PREFIX}/{SAT_PRODUCT}/'
 S3_REGION  = "us-west-2"
@@ -113,24 +113,36 @@ def make_tms_vds(key: str) -> xr.Dataset:
         # Extract actual coordinate values eagerly
         coords = read_tms_coords(key)
         
-        # Determine correct dimension names based on the 3D shape 
-        
         # Let's check what the dataset calls these axes natively
         dim_names = vds["latitude"].dims if "latitude" in vds else ("spots", "along_track_grid", "channels")
         
-        if "scans" in vds.dims:
+        # FIX: Only rename 'scans' if 'along_track_grid' doesn't already exist!
+        if "scans" in vds.dims and "along_track_grid" not in vds.dims:
             vds = vds.rename_dims({"scans": "along_track_grid"})
             dim_names = tuple(d.replace("scans", "along_track_grid") for d in dim_names)
             
-        if "time" in vds.variables: #fix time units
+        if "time" in vds.variables: # fix time units
             vds["time"].attrs["units"] = "seconds since 2000-01-01 00:00:00"
             vds = vds.rename_vars({"time": "time_radiometric"})
             
+        # FIX: Dynamically determine the appropriate dimension name for the 1D time array.
+        # It should match the along-track dimension found in 'dim_names'
+        time_dim = "along_track_grid"
+        if time_dim not in dim_names:
+            if "scans" in dim_names:
+                time_dim = "scans"
+            else:
+                # Fallback: Find the dimension that matches the length of the time array
+                time_len = len(coords["time"])
+                for d in vds.dims:
+                    if vds.dims[d] == time_len:
+                        time_dim = d
+                        break
+        
         # Assign the eagerly read coordinates to the virtual dataset
-        # We use the dynamic 'dim_names' tuple for lat and lon
         vds = vds.assign_coords(
             time=(
-                "along_track_grid", 
+                time_dim, 
                 coords["time"],
                 {"long_name": "observation time", "timezone": "UTC"}
             ),
@@ -147,6 +159,7 @@ def make_tms_vds(key: str) -> xr.Dataset:
         )
     
     return vds
+    
 # Return file keys (without reading)
 def list_s3_netcdf_keys(bucket_name: str,
                         prefix: str) -> List[str]:
